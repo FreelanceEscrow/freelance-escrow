@@ -410,8 +410,6 @@ IPFS            → Pinata (free 1GB)
 ```
 
 
-<img width="1292" height="1178" alt="image" src="https://github.com/user-attachments/assets/38e90554-5130-472d-968d-b50cffedda76" />
-
 ---
 
 *Built with Solidity 0.8.20 · ethers.js v6 · React · Node.js · PostgreSQL · IPFS*
