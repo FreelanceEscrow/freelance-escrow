@@ -1,7 +1,19 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-contract FreelanceEscrow {
+interface IERC20{
+    function tranfer(address to, uint256 amount) external returns(bool);
+    function transferFrom(address from, address to, uint256 amount) external returns(bool);
+    function balanceOf(address account) external view returns(bool);
+    function allowance(address owner, address spender) external view returns(uint256);
+}
+
+interface AutomationCompatibleInterface{
+    function checkUpKeep(bytes calldata checkData) external returns(bool upkeepNeeded, bytes memory performData);
+    function performUpKeep(bytes calldata perfromData) external; 
+}
+
+contract FreelanceEscrow is AutomationCompatibleInterface{
 
     // ── Enum ──────────────────────────────────────────────────
     enum JobStatus {
@@ -25,6 +37,13 @@ contract FreelanceEscrow {
         Other
     }
 
+    enum MilestoneStatus{
+        Pending,
+        Submitted,
+        Approved,
+        Disputed
+    }
+
     // ── Structs ───────────────────────────────────────────────
     struct Job {
         uint256   id;
@@ -41,6 +60,20 @@ contract FreelanceEscrow {
         string    workProof;
         Category  category;
         string[]  tags;
+        address paymentToken;
+        uint256 tokenAmount;
+        bool isTokenPayment;
+    }
+
+    struct Milestone{
+        uint256 id;
+        string title;
+        string description;
+        uint256 payment;
+        MilestoneStatus status;
+        string workProof;
+        uint256 submittedAt;
+        uint256 approvedAt;
     }
 
     struct Rating {
@@ -62,6 +95,28 @@ contract FreelanceEscrow {
         bool    resolved;
     }
 
+    struct Profile{
+        string name;
+        string bio;
+        string portfolioLink;
+        string skills;
+        uint256 hourlyRate;
+        bool available;
+        uint256 createdAt;
+        uint256 approvedAt;
+    }
+
+    struct JobTemplate{
+        uint256 id;
+        string title;
+        string description;
+        Category category;
+        uint256 defaultDeadlineDays;
+        uint256 owner;
+        bool isActive;
+        uint256 createdAt;
+    }
+
     // ── Mappings ──────────────────────────────────────────────
     mapping(uint256 => Job)       public jobs;
     mapping(address => uint256[]) public clientJobs;
@@ -78,6 +133,22 @@ contract FreelanceEscrow {
     mapping(uint256 => bool)      public jobRatedByFreelancer;
     mapping(uint256 => uint256[]) public jobsByCategory;
     mapping(uint256 => Arbiter)   public arbiterVotes;
+    mapping(uint256 => Milestone[]) public jobMilestones;
+    mapping(uint256 => bool) public isMilestoneJob;
+    mapping(uint256 => uint256) public milesstoneCount;
+    mapping(address => Profile) public profile;
+    mapping(address => bool) public hasProfile;
+    uint256[] public allJobIds;
+    mapping(uint8 => uint256) public jobByStatus;
+    uint256[] public autoRefundEligible;
+    mapping(uint256 => bool) public addedToAutoRefund;
+    mapping(address=> uint256) public completedJobCount;
+    mapping(address => uint256) public disputesWon;
+    mapping(address => uint256) public disputesLost;
+    mapping(address => uint256) public totalTipsReceived;
+    mapping(uint256 => JobTemplate) public templates;
+    mapping(address => uint256[]) public myTemplates;
+    uint256 public templateCount;
 
     // ── Events ────────────────────────────────────────────────
     event JobCreated(uint indexed jobId, address indexed client, uint256 payment, string title);
@@ -95,6 +166,18 @@ contract FreelanceEscrow {
     event TipSent(uint256 jobId, address indexed client, address indexed freelancer, uint256 amount);
     event DeadlineExtended(uint256 jobId, uint256 newDeadline, uint256 oldDeadline);
     event ArbiterVoted(uint256 jobId, address indexed arbiter, bool votedForFreelancer);
+    event MilestoneSubmitted(uint256 jobId, uint256 indexed milestoneId, address indexed freelancer, string workProof);
+    event MilestoneApproved(uint256 indexed jobId, uint256 indexed milestoneId, address indexed freelancer, uint256 payment);
+    event MilestoneDisputed(uint256 indexed jobId, uint256 indexed milestoneId, address indexed client);
+    event TokenJobCreated(uint256 indexed jobId, address indexed client, address indexed token, uint256 tokenAmount);
+    event TokenPaymentReleased(uint256 indexed jobId, address indexed freelancer, address indexed token, uint256 payment);
+    event ProfileCreated(address indexed user, string name);
+    event ProfileUpdated(address indexed user, uint256 timestamp);
+    event AutoRefundExecuted(uint256 indexed jobId, address indexed client, uint256 amount);
+    event ReputationUpdated(address indexed user, uint256 newScore);
+    event TemplateCreated(uint256 indexed templateId, address indexed client, string title);
+    event TemplateDeleted(uint256 indexed templateId, address indexed client);
+    event JobCreatedFromTemplate(uint256 indexed jobId, uint256 indexed templateId);
 
     // ── Custom Errors ─────────────────────────────────────────
     error ZeroAddress();
@@ -112,6 +195,19 @@ contract FreelanceEscrow {
     error NotAnArbiter(address caller);
     error AlreadyVoted(address arbiter);
     error DisputeAlreadyResolved();
+    error NotMilestoneJob();
+    error InvalidMilestoneId(uint256 jobId);
+    error MilestoneAlreadyApproved(uint256 jobId);
+    error MilestoneNotSubmitted(uint256 jobId);
+    error TotalMilestonePaymentMismatch(uint256 total, uint256 jobPayment);
+    error TokenTransferFailed();
+    error NotTokenJob();
+    error InsufficientAllowance(uint256 allowance, uint256 required);
+    error ProfileNotFound(address user);
+    error ProfileAlreadyExists(address user);
+    error TemplateNotFound(uint256 id);
+    error NotTemplateOwner(address client);
+    error TemplateInactive(uint256 id);
 
     // ── Constructor ───────────────────────────────────────────
     constructor() {
@@ -153,7 +249,7 @@ contract FreelanceEscrow {
         _;
     }
 
-    // ── Create Job ────────────────────────────────────────────
+    // CORE — CREATE JOB (ETH payment)
     function createJob(
         address freelancer,
         address arbiter1,
@@ -167,6 +263,7 @@ contract FreelanceEscrow {
     )
         external
         payable
+        whenNotPaused
         validAddress(freelancer)
         validAddress(arbiter1)
         validAddress(arbiter2)
@@ -198,7 +295,10 @@ contract FreelanceEscrow {
             submittedAt: 0,
             workProof:   "",
             category:    category,
-            tags:        new string[](0)
+            tags:        new string[](0),
+            paymentToken: address(0),
+            tokenAmount: 0,
+            isTokenPayment: true
         });
 
         for (uint256 i = 0; i < tags.length; i++) {
@@ -209,12 +309,270 @@ contract FreelanceEscrow {
         freelancerJobs[freelancer].push(jobId);
         jobsByCategory[uint256(category)].push(jobId);
 
+        allJobsId.push(jobId);
+        jobsByStatus[uint8(JobStatus.Funded)].push(jobId);
+
         arbiterVotes[jobId].arbiter1 = arbiter1;
         arbiterVotes[jobId].arbiter2 = arbiter2;
         arbiterVotes[jobId].arbiter3 = arbiter3;
 
+        _addToAutoRefund(jobId);
+
         emit JobCreated(jobId, msg.sender, msg.value, title);
         emit JobFunded(jobId, msg.sender, msg.value);
+    }
+
+    // CREATE JOB WITH ERC-20 TOKEN PAYMENT
+
+    function createJobWithToken(
+        address freelancer,
+        address arbiter1,
+        address arbiter2,
+        address arbiter3,
+        string memory title,
+        string memory description,
+        uint256 deadlineDays,
+        Category category,
+        string memory tags,
+        address tokenAddress,
+        uint256 tokenAmount
+    )
+    external
+    payable 
+    whenNotPaused
+    validAddress(freelancer)
+    validAddress(arbiter1)
+    validAddress(arbiter2)
+    validAddress(arbiter3)
+    validAddress(tokenAddress)
+    returns(uint256 jobId)
+    {
+        require(bytes(title).length > 0, "Title must be Required");
+        require(deadlineDays > 0, "Deadline must be greater than zero");
+        require(freelancer != msg.sender, "Cannot hire yourself");
+        require(tokenAmount > 0, "Amount must be greater than zero");
+        require(arbiter1!=arbiter2 && arbiter2 != arbiter3 && arbiter1 != arbiter3, "Arbiter must be different");
+
+        uint256 allowed = token.allowance(msg.sender, address(this));
+        if(allowed < tokenAmount){
+            revert InsufficientAllowance(allowed, tokenAmount);
+        }
+
+        bool pulled = token.transferFrom(msg.sender, address(this), tokenAmount);
+        if(!pulled) revert TokenTransferFailed();
+
+        jobId = ++jobsCOunt;
+        jobs[jobId] = Job({
+            id: jobId,
+            client: msg.sender,
+            freelancer: freelancer.
+            arbiter: arbiter1,
+            payment: 0,
+            deadline: block.timestamp + (deadlineDays * 1 Days),
+            status: JobStatus.Funded,
+            title: title,
+            description: description,
+            createdAt: block.timestamp,
+            submittedAt: 0,
+            workProof: "",
+            category: category,
+            tags: new string[](0),
+            paymentToken: tokenAddress,
+            tokenAmount: tokenAmoutn,
+            isTokenPayment: true
+        });
+
+        for(uint256 i = 0; i < tags.length; i++){
+            jobs[jobId].tags.push(tags[i]);
+        }
+        clientJobs[msg.sender].push(jobId);
+        freelancerJobs[freelancer].push(jobId);
+        jobsByCategory[uint256(category)].push(jobId);
+        allJobsId.push(jobId);
+        jobsByStatus[uint256(JobStatus.Funded)].push(jobId);
+
+        arbiterVotes[jobId].arbiter1 = arbiter1;
+        arbiterVOtes[jobId].arbiter2 = arbiter2;
+        arbiterVotrs[jobId].arbiter3 = arbiter3;
+
+        _addToAutoRefund(jobId);
+
+        emit TokenJobCreated(jobId, msg.sender, tokenAddress, tokenAmount);
+        emit JobCreated(jobId, msg.sender, tokenAmount, title);
+    }
+
+    // CREATE JOB WITH MILESTONES
+
+    function createJobWithMilestone(
+        address freelancer,
+        address arbiter1,
+        address arbiter2,
+        address arbiter3,
+        string memory title,
+        strinf memory description,
+        uint256 deadlineDays,
+        Category category,
+        string[] memory milestoneTitles,
+        string[] memory milesstoneDescriptions,
+        uint256[] memory milestonePayments
+    ) 
+    external 
+    payable
+    whenNotPaused
+    validAddress(freelancer)
+    validAddress(arbiter1)
+    validAddress(arbiter2)
+    validAddress(arbiter3)
+    returns(uint256 jobId)
+    {
+        require(msg.value > 0, "Must fund the Job");
+        require(bytes(title).length > 0, "Title Required");
+        require(deadlineDays > 0, "Invalid Deadline");
+        require(freelancer != msg.sender, "Cannot hire yourself");
+        require(milestoneTitles.length == milestonePayment.length && milestoneTitles == milestoneDescription, "Milestone Arrays must match");
+        require(milesstoneTitles.length > 0, "need at least 1 character");
+        require(arbiter1 != arbiter2 && arbiter2 != arbiter3 && arbiter1 != arbiter3, "Arbiter must be different");
+
+        uint256 totalPayments = 0;
+        for(uint256 i = 0; i< milestonePayments.length; i++){
+            totalPayments += milesstonePayments[i];
+        }
+        if(totalPayments != msg.value){
+            revert TotalMilestonePaymentMismatch(totalPayment, msg.value);
+        }
+
+        jobId = ++jobCount;
+
+        jobs[jobId] = Job({
+            id: jobId,
+            freelancer: freelancer,
+            client: msg.sender,
+            arbiter: arbiter1,
+            payment: msg.value,
+            deadline: block.timestamp + (deadlineDays * 1 Days),
+            status: JobStatus.Funded,
+            title: title,
+            description: description,
+            createdAt: block.timestamp,
+            submittedAt: 0,
+            workProof: "",
+            category: category,
+            tags: new string[](0),
+            paymentToken: address(0),
+            tokenAmount: 0,
+            isTokenPayment: false
+        });
+
+        for(uint256 i = 0; i < milestoneTitles.length; i++){
+            jobMilestone[jobId].push(Milestone({
+                id: i,
+                title: milestoneTitles[i],
+                description: milestoneDescriptions[i],
+                payment: milestonePayments[i],
+                status: MilestoneStatus.Pending,
+                workProof: "",
+                submittedAt: 0,
+                approvedAt: 0
+            }));
+        }
+
+        clientJobs[msg.sender].push(jobId);
+        freelancerJobs[freelancer].push(jobId);
+        jobsByCategory[uint256(category)].push(jobId);
+        alljobsId.push(jobId);
+        jobsByStatus[uint256(JobStatus.Funded)].push(jobId);
+
+        arbiterVotes[jobId].arbiter1 = arbiter1;
+        arbiterVotes[jobId].arbiter2 = arbiter2;
+        arbiterVotes[jobId].arbiter3 = arbiter3;
+
+        _addToAutoRefund(jobId);
+
+        emit JobCreated(jobId, msg.sender, msg.value, title);
+        emit JobFunded(jobId, msg.sender, msg.value);
+    }
+
+    // Freelancer submits a specific milestone
+
+    function submitMilestone(
+        uint256 jobId,
+        uint256 milestoneId,
+        string memory workProof
+    )
+    external
+    onlyFreelancer(jobId)
+    whenNotPaused,
+    beforeDeadline(jobId)
+    {
+        if(!isMilestoneJob[jobId]) revert NotMilestoneJob();
+        if(milestoneId > jobMilestones[jobId].length) revert InvalidMilestoneId(milestoneId);
+        require(bytes(workProof).length > 0, "Work Proof Required");
+
+        Milestone storage m = jobMilestones[jobId][milestoneId];
+        require(m.status == MilestoneStatus.Pending, "Milestone already submitted or approved");
+
+        m.status = MilestoneStatus.Submitted;
+        m.workProof = workProof;
+        m.submittedAt = block.timestamp;
+
+        emit MilestoneSubmitted(jobId, milestoneId, msg.sender, workProof);
+    }
+
+    // Client approves a milestone -> freelancer paid
+
+    function approveMilestone(uint256 jobId, uint256 milestoneId)external onlyClient(jobId) whenNotPaused{
+        if(!isMilestoneJob[jobId]) revert NotMilestoneJob();
+        if(milestoneId >= jobMilestones[jobId].length) revert InvalidMilestoneId(milestoneId);
+
+        Milestone storage m = jobMilestones[jobId][milestoneId];
+
+        if(m.status == MilestoneStatus.Approved) revert MilestoneAlreadyApproved(milestoneId);
+        if(m.status != MilestoneStatus.Submitted) revert MilestoneNotSubmitted(milestoneId);
+
+        m.status = MilestoneStatus.Approved;
+        m.approvedAt = block.timestamp;
+
+        uint256 fee = (m.payment * platform_fee)/ 10_000;
+        uint256 payout = m.payment - fee;
+
+        (bool ok1, ) = jobs[jobId].freelancer.call{value : payout}("");
+        require(ok1, "Milestone Payment Failed");
+
+        if(fee > 0){
+            (bool ok2, ) = owner.call{value : fee}("");
+            require(ok2, "Fee Payment Failed");
+        }
+
+        completedJobsCount[jobs[jobId].freelancer]++;
+
+        emit MilestoneApproved(jobId, milestoneId, jobs[jobId].freelancer, payout);
+    }
+
+    // Client disputes a milestone
+
+    function disputeMilestone(uint256 jobId, uint256 milestoneId) external onlyClient(jobId){
+        if(!MilestoneJob[jobId]) revert NotMilestoneJob();
+        if(milestoneId >= jobsMilestone[jobId].length) revert InvalidMilestoneId(milestoneId);
+
+        Milestone storage m = jobMilestones[jobId][milestoneId];
+        require(m.status == MilestoneStatus.Submitted, "Milestone not submitted");
+
+        m.status = MilestoneStats.Disputed;
+
+        emit MilestoneDisputed(jobId, milestoneId, msg.sender);
+    }
+
+    // Get all milestones for a job
+
+    function getMilestones(uint256 jobId) external view returns(Milestone[] memory){
+        return jobMilestones[jobId];
+    }
+
+    // Get specific milestone
+
+    function getMilestone(uint256 jobId, uint256 milestoneId) external view returns(Milestone memory){
+        require(milestoneId < jobMilestones[jobId].length, "Invalid Milestone");    
+        return jobMilestones[jobId][milestoneId];
     }
 
     // ── Start Job ─────────────────────────────────────────────
@@ -259,15 +617,42 @@ contract FreelanceEscrow {
         uint256 fee    = (job.payment * platformFee) / 10_000;
         uint256 payout = job.payment - fee;
 
-        (bool ok1, ) = job.freelancer.call{value: payout}("");
-        require(ok1, "Freelancer payment failed");
+        // pay in ETH or token depending on job type
 
-        if (fee > 0) {
-            (bool ok2, ) = owner.call{value: fee}("");
-            require(ok2, "Fee payment failed");
+        if(job.isTokenPayment){
+            _payWithToken(job.paymentToken, job.freelancer, job.tokenAmount, fee);
+        }else{
+            (bool ok1, ) = job.freelancer.call{value : "payout"}("");
+            require(ok1, "Freelancer Payment Failed");
+
+            if( fee > 0){
+                (bool ok2, ) = owner.call{value : "fee"}("");
+                require(ok2, "Fee Payment Failed");
+            }
         }
 
+        completedJobsCount[job.freelancer];
+        emit ReputationUpdated(job.freelancer, getReputationScoree[jobs.freelancer]);
         emit JobCompleted(jobId, job.freelancer, payout);
+    }
+
+    // Internal: pay with ERC-20 token
+
+    function _payWithToken(address tokenAddress, address freelnacer, uint256 tokenAmount, uint256 fee) internal{
+        IERC20 token = IERC20(tokenAddress);
+
+        uint256 tokenFee = (tokenAmount * platformFee) / 10_000;
+        uint256 tokenPayout = tokenAmount - tokenFee;
+
+        bool ok1 = token.transfer(freelancer, tokenpayout);
+        if(!ok1) revert TokenTransferFailed();
+
+        if(tokenFee > 0){
+            bool ok2 = token.transfer(owner, tokenfee);
+            if(!ok2) revert TokenTranferFailed();
+        }
+
+        emit TokenPaymentReleased(0, freelancer, tokenAddress, tokenPayout);
     }
 
     // ── Raise Dispute ─────────────────────────────────────────
@@ -302,6 +687,14 @@ contract FreelanceEscrow {
             require(ok2, "Arbiter payment failed");
         }
 
+        if(freelancerWins){
+            disputesWon[jobs.freelancer]++;
+            disputesLost[jobs.client++;]
+        }else{
+            disputesWon[jobs.client]++;
+            disputesLost[jobs.freelancer]++;
+        }
+
         emit DisputeResolved(jobId, winner, payout);
     }
 
@@ -317,8 +710,13 @@ contract FreelanceEscrow {
 
         job.status = JobStatus.Refunded;
 
-        (bool ok, ) = job.client.call{value: job.payment}("");
-        require(ok, "Refund failed");
+        if(job.isTokenPayment){
+            bool ok = IERC20(job.paymentToken).transfer(job.client, job.tokenAmount);
+            if(!ok1) revert TokenTransferFailed();
+        }else{
+            (bool ok,) = job.client.call{value : "job.payment"}("");
+            require(ok, "Refund Failed");
+        }
 
         emit JobCancelled(jobId, msg.sender);
     }
@@ -336,8 +734,13 @@ contract FreelanceEscrow {
 
         job.status = JobStatus.Refunded;
 
-        (bool ok, ) = job.client.call{value: job.payment}("");
-        require(ok, "Refund failed");
+        if(job.isTokenPayment){
+            bool ok = IERC20(job.paymentToken).transfer(job.client, job.tokenAmount);
+            if(!ok) revert TokenTransferFailed();
+        }else{
+            bool ok = job.client.call{value : "job.payment"}("");
+            require(ok, "Refund Failed");
+        }
 
         emit JobCancelled(jobId, msg.sender);
     }
@@ -373,6 +776,7 @@ contract FreelanceEscrow {
             givenAt: block.timestamp
         }));
 
+        emit ReputationUpdated(jobs[jobId].freelancer, getReputationScore(jobs[jobId].freelancer));
         emit FreelancerRated(jobId, jobs[jobId].freelancer, score);
     }
 
@@ -441,6 +845,8 @@ contract FreelanceEscrow {
 
         (bool ok, ) = jobs[jobId].freelancer.call{value: msg.value}("");
         require(ok, "Tip transfer failed");
+
+        totalTipsReceived[jobs[jobId].freelancer]+= msg.value;
 
         emit TipSent(jobId, msg.sender, jobs[jobId].freelancer, msg.value);
     }
@@ -555,6 +961,14 @@ contract FreelanceEscrow {
             require(ok3, "Arbiter3 payment failed");
         }
 
+        if(freelancerWins){
+            disputesWon[freelancer]++;
+            disputesLost[client]++;
+        }else{
+            diputesWon[client]++;
+            disputesLost[freelancer]++;
+        }
+
         emit DisputeResolved(jobId, winner, payout);
     }
 
@@ -578,6 +992,346 @@ contract FreelanceEscrow {
             av.arbiter2,
             av.arbiter3
         );
+    }
+
+    // Creating Freelancer profile
+
+    function createProfile (string memory name, string memory bio, string memory portfolioLink, string memory skills, uint256 hourlyRate) external {
+        if(hasProfile[msg.sender]) revert ProfileAlreadyExists(msg.sender);
+        require(bytes(name).length > 0, "Name Required");
+
+        profiles[msg.sender] = Profile({
+            name : name,
+            bio : bio,
+            portfolioLink : portfolioLink,
+            skills : skills,
+            hourlyRate : hourlyRate,
+            available : true,
+            createdAt : block.timestamp,
+            updatedAt : block.timestamp
+        });
+
+        hasProfile[msg.sender] = true;
+
+        emit ProfileCreated(msg.sender, name);
+    }
+
+    // Update your Profile
+
+    function updateProfile() external {
+        if(hasProfile[msg.sender]) revert ProfileAlreadyExists(msg.sender);
+
+        Profile storage p = profiles[msg.sender];
+        p.bio = bio;
+        p.portfolioLink = portfolioLink;
+        p.skills = skills;
+        p.hourlyRate = hourlyRate;
+        p.updatedAt = block.timestamp;
+
+        emit ProfileUpdated(msg.sender, block.timestamp);
+    }
+
+    // Get any profile
+
+    function getProfile(address user) external view returns(Profile memory){
+        if(!hasProfile[user]) revert ProfileNotFound(user);
+        return profiles[user];
+    }
+
+    // Check if address has profile
+
+    function profileExists(address user) external view returns(bool){
+        return hasProfile[user];
+    }
+
+    // Get jobs by status
+
+    function getJobsByStatus(JobStatus status) external view returns(uint256[] memory){
+        return jobsByStatus[uint8(status)];
+    }
+
+    // Get all jobs with pagination
+
+    function getJobsPaginated(uint256 offset, uint256 limit) external view returns(uint256[] memory result, uint256 total){
+        total = allJobsIds.length;
+        if(offset >= total){
+            return (new uint256[](0), total);
+        }
+        uint256 end = offset + limit;
+        if(end > total) end = total;
+
+        result = new uint256[](end - offset);
+        for(uint i = offset; i < end; i++){
+            result[i - offset] = allJobIds[i];
+        }
+    }
+
+    // Get jobs within a budget range
+
+    function getJobsByBudget(uint256 minBudget, uint256 maxBudget) external view returns(uint256[] memory){
+        uint256 count = 0;
+        for(uint256 i = 0; i < allJobIds.length; i++){
+            uint256 jid = allJobIds[i];
+
+            if(jid.payment >= minBudget && jid.payment <= maxBudget && jid.payment == JobStatus.Funded){
+                count++;
+            }
+        }
+
+        uint256[] memory result = new uint256[](count);
+        uint256 idx = 0;
+        for(uint256 i = 0; i < allJobIds.length; i++){
+            uint256 jid = allJobIds[i];
+            if(jid.payment >= minBudget && jid.payment <= maxBudget && jid.payment == JobStatus.Funded){
+                result[idx++] = jid;
+            }
+        }
+        return result;
+    }
+
+    // Get all OPEN (Funded) jobs
+
+    function getOpenJobs() external view returns(uint256[] memory){
+        return jobsByStatus[uint8(JobStatus.Funded)];
+    }
+
+    // Get total jobs count
+
+    function getTotalJobs() external view returns(uint256){
+        return allJobIds.length;
+    }
+
+    // AUTO REFUND (Chainlink Automation)
+
+    // Internal: add job to auto refund list
+
+    function _addToAutoRefund(uint256 jobId) internal{
+        if(!addedToAutoRefund[jobId]){
+            autoRefundEligible.push[jobId];
+            addedToAutoRefund[jobId] = true;
+        }
+    }
+
+    // Chainlink calls this to check if work needed
+
+    function checkUpKeep(bytes calldata) external view override returns(bool upKeepNeeded, bytes memory performData)[
+        for(uint256 i = 0; i < autoRefundEligible.length; i++){
+            uint256 jobId = autoRefundEligible[i];
+            Job storage job = jobs[jobId];
+
+            if(block.timestamp > deadline && jobs.status == JobStatus.Funded || job.status == JobStatus.Started){
+                upKeepNeeded = true;
+                performData = abi.encode(jobId);
+                return(upKeepNeeded, performData);
+            }
+        }
+        return(false, "");
+    ]
+
+    // Chainlink calls this to execute the refund
+
+    function performUpKeep(bytes calldata performData) external override{
+        uint256 jobId = abi.decode(performData, (uint256));
+        Job storage job = jobs[jobId];
+
+        require(block.timestamp > job.deadline, "Deadline Not Passed");
+        require(job.status == JobStatus.Funded || job.status == JobStatus.Started, "Cannot auto refund at this stage");
+
+        job.status == JobStatus.Refunded;
+
+        if(job.isTokenPayment){
+            (bool ok, ) = IERC20(job.paymentToken).transfer(job.client, job.tokenAmount);
+            require(ok, "Token Refund Failed");
+        }else{
+            (bool ok, ) = job.client.call{value : job.payment}("");
+            require(ok, "Auto Refund Failed");
+        }
+
+        emit AutoRefundExecuted(jobId, job.client, job.payment);
+        emit JobCancelled(jobId, address(this));
+    }
+
+    // REPUTATION SCORE
+
+    // Calculate reputation score (0 to 100)
+
+    function getReputationScore(address user) public view returns(uint256 score){
+        // Component 1: Completed jobs (max 40 points)
+        // 1 job = 2 points, max 40 points (20 jobs)
+
+        uint256 jobScore = completedJobsCount[user] * 2;
+        if(jobScore > 40) jobScore = 40;
+
+        // Component 2: Average rating (max 30 points)
+        // 5 stars = 30 points, 1 star = 6 points
+
+        Rating[] memory ratings = freelancerRatings[user];
+        uint256 ratingScore = 0;
+        if(ratings.length > 0){
+            uint256 totalStars = 0;
+            for(uint i = 0; i < ratings.length; i++){
+                totalStars += ratings[i].score;
+            }
+            uint256 avgStars = totalStars/ratings.length;
+            ratingScore = avgStars * 6;
+        }
+
+        // Component 3: Dispute record (max 20 points)
+        // Each win = +2 points, each loss = -3 points
+
+        uint256 disputeScore = 0;
+        uint256 wins = disputesWon[user];
+        uint256 losses = disputesLost[user];
+
+        if(wins * 2 > losses * 3){
+            disputeScore = (wins * 2) - (losses * 3);
+        }
+        if(disputeScore > 20) disputeScore = 20;
+
+        // Component 4: Tips received (max 10 points)
+        // Every 0.1 ETH in tips = 1 point, max 10
+
+        uint256 tipScore = totalTipsReceived[user]/0.1 ether;
+        if(tipScore > 10) tipScore = 10;
+
+        score = jobScore + ratingScore + disputeScore + tipScore;
+        if(score > 100) score = 100;
+    }
+
+    // Get full reputation breakdown
+
+    function getReputationBreakdown(address user) external view returns(uint256 totalScore, uint256 jobsCompleted, uint256 averageRating, uint256 diputesWin, uint256 diputesLost, uint256 tipsReceivedWei){
+        totalScore = getReputationScore(user);
+        jobsCompleted = completedJobsCount[user];
+        disputesWin = disputesWon[user];
+        disputesLost = diputeLost[user];
+        tipsReceivedWei = totalTipsReceived[user];
+
+        Rating[] memory ratings = freelancerRatings[user];
+        if(ratings.length > 0){
+            uint256 total = 0;
+            for(uint256 i = 0; i < ratings.length; i++){
+                total += ratings[i].score;
+            }
+
+            averageRating = (total * 10) / ratings.length;
+        }
+    }
+
+    // Get reputation level as string
+
+    function getReputationLevel(address user) external view returns(string memory level){
+        uint256 score = getReputationScore(user);
+
+        if(score >= 90) return "Diamond";
+        if(score >= 75) return "Gold";
+        if(score >= 50) return "Silver";
+        if(score >= 25) return "Bronze";
+        return "New Comer";
+    }
+
+    // JOB TEMPLATES
+
+    // Save a job template
+
+    function saveTemplate(string memory title, string memory description, Category category, uint256 defaultDeadlineDays, uint256 defaultBudget) external view returns (uint256 templateId){
+        require(bytes(title).length > 0, "Title Required");
+        require(defaultDeadlineDays > 0, "Invalid Deadline Days");
+
+        templateId = ++templateCount;
+        
+        templates[templateId] = JobTemplate({
+            id : templateId,
+            title : title,
+            description : description,
+            defaultDeadlineDays : defaultDeadlineDays,
+            defaultBudget : defaultBudget,
+            owner : msg.sender,
+            isActive : true,
+            createdAt : block.timestamp
+        });
+
+        myTemplate[msg.sender].push(templateId);
+
+        emit TemplateCreated(templateId, msg.sender, title);
+    }
+
+    // Delete (deactivate) a template
+
+    function deleteTemplate(uint256 templateId) external{
+        if(templateId == 0 || templateId > templateCount) revert TemplateNitFound(templateId);
+        if(templates[templateId].owner != msg.sender) revert NotTemplateOwner(msg.sender);
+
+        templates[templateId].isActive = false;
+
+        emit TemplateDeleted(templateId, msg.sender);
+    }
+
+    // Create a job using a saved template
+
+    function createJobFromTemplate(uint256 templateId, address freelancer, address arbiter1, address arbiter2, address arbiter3, string[] memory tags) external payable whenNotPaused validAddress(freelancer) validAddress(arbiter1) validAddress(arbiter2) validAddress(arbiter3) returns(uint256 jobId){
+        if(templateId == 0 || templateId > templateCount) revert TemplateNotFound(templateId);
+        JobTemplate memory tmpl = templates[templateId];
+
+        if(!tmpl.isActive) revert TemplateInactive(templateId);
+        require(msg.value > 0, "Must fund the job");
+        require(freelancer != msg.sender, "Cannot hire yourself");
+        require(arbiter1 != arbiter2 && arbiter2 != arbiter3 && arbiter3 != arbiter1, "Arbiter must be different");
+
+        jobId = ++jobCount;
+
+        jobs[jobId] = Job({
+            id : jobId,
+            client : msg.sender,
+            freelancer : freelancer,
+            arbiter : arbiter1,
+            payment : msg.value
+            deadline : block.timestamp + (tmpl.defaultDeadlineDays * 1 days),
+            status : JobStatus.Funded,
+            title : tmpl.title,
+            description : tmpl.description,
+            createdAt : block.timestamp,
+            submittedAt : 0,
+            workProof : "",
+            category : tmpl.category,
+            tags : string[](0),
+            paymentToken : address(0),
+            tokenAmount : 0,
+            isTokenPayment : false
+        });
+
+        for(uint i = 0; i < tags.length; i++){
+            jobs[jobId].push(tags[i]);
+        }
+
+        clientJobs[msg.sender].push(jobId);
+        freelancerJobs[freelancer].push(jobId);
+        jobsByCategory[uint256(tmpl.category)].push(jobId);
+        allJobsId.push(jobId);
+        jobsByStatus[uint8(JobStatus.Funded)].push(jobId);
+
+        arbiterVotes[jobId].arbiter1 = arbiter1;
+        arbiterVotes[jobId].arbiter2 = arbiter2;
+        arbiterVotes[jobId].arbiter3 = arbiter3;
+
+        _addToAutoRefund(jobId);
+
+        emit JobCreatedFromTemplate(jobId, templateId);
+        emit JobCreated(jobId, msg.sender, msg.value, tmpl.title);
+        emit JobFunded(jobId, msg.sender, msg.value);
+    }
+
+    // Get a specific template
+
+    function getTemplate(uint256 templateId) external view returns(JobTemplate memory){
+        if(templateId == 0 || templateId > templateCount) revert TemplateNotFound(templateId);
+        return templates[templateId];
+    }
+
+    // Get all templates created by an address
+
+    function getMyTemplate(uint256 templateId) external view returns(uint256[] memory){
+        return myTemplates[user];
     }
 
     // ── View Functions ────────────────────────────────────────
