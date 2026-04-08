@@ -2,9 +2,9 @@
 pragma solidity ^0.8.20;
 
 interface IERC20{
-    function tranfer(address to, uint256 amount) external returns(bool);
+    function transfer(address to, uint256 amount) external returns(bool);
     function transferFrom(address from, address to, uint256 amount) external returns(bool);
-    function balanceOf(address account) external view returns(bool);
+    function balanceOf(address account) external view returns(uint256);
     function allowance(address owner, address spender) external view returns(uint256);
 }
 
@@ -103,7 +103,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         uint256 hourlyRate;
         bool available;
         uint256 createdAt;
-        uint256 approvedAt;
+        uint256 updatedAt;
     }
 
     struct JobTemplate{
@@ -112,7 +112,8 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         string description;
         Category category;
         uint256 defaultDeadlineDays;
-        uint256 owner;
+        uint256 defaultBudget;
+        address owner;
         bool isActive;
         uint256 createdAt;
     }
@@ -135,11 +136,11 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
     mapping(uint256 => Arbiter)   public arbiterVotes;
     mapping(uint256 => Milestone[]) public jobMilestones;
     mapping(uint256 => bool) public isMilestoneJob;
-    mapping(uint256 => uint256) public milesstoneCount;
-    mapping(address => Profile) public profile;
+    mapping(uint256 => uint256) public milestoneCount;
+    mapping(address => Profile) public profiles;
     mapping(address => bool) public hasProfile;
     uint256[] public allJobIds;
-    mapping(uint8 => uint256) public jobByStatus;
+    mapping(uint8 => uint256[]) public jobsByStatus;
     uint256[] public autoRefundEligible;
     mapping(uint256 => bool) public addedToAutoRefund;
     mapping(address=> uint256) public completedJobCount;
@@ -249,6 +250,64 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         _;
     }
 
+    // LEGACY COMPAT — CREATE JOB (single arbiter + default category/tags)
+    function createJob(
+        address freelancer,
+        address arbiter,
+        string memory title,
+        string memory description,
+        uint256 deadlineDays
+    )
+        external
+        payable
+        whenNotPaused
+        validAddress(freelancer)
+        validAddress(arbiter)
+        returns (uint256 jobId)
+    {
+        require(msg.value > 0,            "Must fund the job");
+        require(bytes(title).length > 0,  "Title required");
+        require(deadlineDays > 0,         "Invalid deadline");
+        require(freelancer != msg.sender, "Cannot hire yourself");
+
+        jobId = ++jobCount;
+
+        jobs[jobId] = Job({
+            id: jobId,
+            client: msg.sender,
+            freelancer: freelancer,
+            arbiter: arbiter,
+            payment: msg.value,
+            deadline: block.timestamp + (deadlineDays * 1 days),
+            status: JobStatus.Funded,
+            title: title,
+            description: description,
+            createdAt: block.timestamp,
+            submittedAt: 0,
+            workProof: "",
+            category: Category.Other,
+            tags: new string[](0),
+            paymentToken: address(0),
+            tokenAmount: 0,
+            isTokenPayment: false
+        });
+
+        clientJobs[msg.sender].push(jobId);
+        freelancerJobs[freelancer].push(jobId);
+        jobsByCategory[uint256(Category.Other)].push(jobId);
+        allJobIds.push(jobId);
+        jobsByStatus[uint8(JobStatus.Funded)].push(jobId);
+
+        arbiterVotes[jobId].arbiter1 = arbiter;
+        arbiterVotes[jobId].arbiter2 = arbiter;
+        arbiterVotes[jobId].arbiter3 = arbiter;
+
+        _addToAutoRefund(jobId);
+
+        emit JobCreated(jobId, msg.sender, msg.value, title);
+        emit JobFunded(jobId, msg.sender, msg.value);
+    }
+
     // CORE — CREATE JOB (ETH payment)
     function createJob(
         address freelancer,
@@ -298,7 +357,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
             tags:        new string[](0),
             paymentToken: address(0),
             tokenAmount: 0,
-            isTokenPayment: true
+            isTokenPayment: false
         });
 
         for (uint256 i = 0; i < tags.length; i++) {
@@ -309,7 +368,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         freelancerJobs[freelancer].push(jobId);
         jobsByCategory[uint256(category)].push(jobId);
 
-        allJobsId.push(jobId);
+        allJobIds.push(jobId);
         jobsByStatus[uint8(JobStatus.Funded)].push(jobId);
 
         arbiterVotes[jobId].arbiter1 = arbiter1;
@@ -333,7 +392,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         string memory description,
         uint256 deadlineDays,
         Category category,
-        string memory tags,
+        string[] memory tags,
         address tokenAddress,
         uint256 tokenAmount
     )
@@ -353,6 +412,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         require(tokenAmount > 0, "Amount must be greater than zero");
         require(arbiter1!=arbiter2 && arbiter2 != arbiter3 && arbiter1 != arbiter3, "Arbiter must be different");
 
+        IERC20 token = IERC20(tokenAddress);
         uint256 allowed = token.allowance(msg.sender, address(this));
         if(allowed < tokenAmount){
             revert InsufficientAllowance(allowed, tokenAmount);
@@ -361,14 +421,14 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         bool pulled = token.transferFrom(msg.sender, address(this), tokenAmount);
         if(!pulled) revert TokenTransferFailed();
 
-        jobId = ++jobsCOunt;
+        jobId = ++jobCount;
         jobs[jobId] = Job({
             id: jobId,
             client: msg.sender,
-            freelancer: freelancer.
+            freelancer: freelancer,
             arbiter: arbiter1,
             payment: 0,
-            deadline: block.timestamp + (deadlineDays * 1 Days),
+            deadline: block.timestamp + (deadlineDays * 1 days),
             status: JobStatus.Funded,
             title: title,
             description: description,
@@ -378,7 +438,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
             category: category,
             tags: new string[](0),
             paymentToken: tokenAddress,
-            tokenAmount: tokenAmoutn,
+            tokenAmount: tokenAmount,
             isTokenPayment: true
         });
 
@@ -388,12 +448,12 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         clientJobs[msg.sender].push(jobId);
         freelancerJobs[freelancer].push(jobId);
         jobsByCategory[uint256(category)].push(jobId);
-        allJobsId.push(jobId);
-        jobsByStatus[uint256(JobStatus.Funded)].push(jobId);
+        allJobIds.push(jobId);
+        jobsByStatus[uint8(JobStatus.Funded)].push(jobId);
 
         arbiterVotes[jobId].arbiter1 = arbiter1;
-        arbiterVOtes[jobId].arbiter2 = arbiter2;
-        arbiterVotrs[jobId].arbiter3 = arbiter3;
+        arbiterVotes[jobId].arbiter2 = arbiter2;
+        arbiterVotes[jobId].arbiter3 = arbiter3;
 
         _addToAutoRefund(jobId);
 
@@ -409,11 +469,11 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         address arbiter2,
         address arbiter3,
         string memory title,
-        strinf memory description,
+        string memory description,
         uint256 deadlineDays,
         Category category,
         string[] memory milestoneTitles,
-        string[] memory milesstoneDescriptions,
+        string[] memory milestoneDescriptions,
         uint256[] memory milestonePayments
     ) 
     external 
@@ -429,16 +489,16 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         require(bytes(title).length > 0, "Title Required");
         require(deadlineDays > 0, "Invalid Deadline");
         require(freelancer != msg.sender, "Cannot hire yourself");
-        require(milestoneTitles.length == milestonePayment.length && milestoneTitles == milestoneDescription, "Milestone Arrays must match");
-        require(milesstoneTitles.length > 0, "need at least 1 character");
+        require(milestoneTitles.length == milestonePayments.length && milestoneTitles.length == milestoneDescriptions.length, "Milestone Arrays must match");
+        require(milestoneTitles.length > 0, "need at least 1 milestone");
         require(arbiter1 != arbiter2 && arbiter2 != arbiter3 && arbiter1 != arbiter3, "Arbiter must be different");
 
         uint256 totalPayments = 0;
         for(uint256 i = 0; i< milestonePayments.length; i++){
-            totalPayments += milesstonePayments[i];
+            totalPayments += milestonePayments[i];
         }
         if(totalPayments != msg.value){
-            revert TotalMilestonePaymentMismatch(totalPayment, msg.value);
+            revert TotalMilestonePaymentMismatch(totalPayments, msg.value);
         }
 
         jobId = ++jobCount;
@@ -449,7 +509,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
             client: msg.sender,
             arbiter: arbiter1,
             payment: msg.value,
-            deadline: block.timestamp + (deadlineDays * 1 Days),
+            deadline: block.timestamp + (deadlineDays * 1 days),
             status: JobStatus.Funded,
             title: title,
             description: description,
@@ -464,7 +524,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         });
 
         for(uint256 i = 0; i < milestoneTitles.length; i++){
-            jobMilestone[jobId].push(Milestone({
+            jobMilestones[jobId].push(Milestone({
                 id: i,
                 title: milestoneTitles[i],
                 description: milestoneDescriptions[i],
@@ -476,11 +536,14 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
             }));
         }
 
+        isMilestoneJob[jobId] = true;
+        milestoneCount[jobId] = milestoneTitles.length;
+
         clientJobs[msg.sender].push(jobId);
         freelancerJobs[freelancer].push(jobId);
         jobsByCategory[uint256(category)].push(jobId);
-        alljobsId.push(jobId);
-        jobsByStatus[uint256(JobStatus.Funded)].push(jobId);
+        allJobIds.push(jobId);
+        jobsByStatus[uint8(JobStatus.Funded)].push(jobId);
 
         arbiterVotes[jobId].arbiter1 = arbiter1;
         arbiterVotes[jobId].arbiter2 = arbiter2;
@@ -501,11 +564,11 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
     )
     external
     onlyFreelancer(jobId)
-    whenNotPaused,
+    whenNotPaused
     beforeDeadline(jobId)
     {
         if(!isMilestoneJob[jobId]) revert NotMilestoneJob();
-        if(milestoneId > jobMilestones[jobId].length) revert InvalidMilestoneId(milestoneId);
+        if(milestoneId >= jobMilestones[jobId].length) revert InvalidMilestoneId(milestoneId);
         require(bytes(workProof).length > 0, "Work Proof Required");
 
         Milestone storage m = jobMilestones[jobId][milestoneId];
@@ -532,7 +595,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         m.status = MilestoneStatus.Approved;
         m.approvedAt = block.timestamp;
 
-        uint256 fee = (m.payment * platform_fee)/ 10_000;
+        uint256 fee = (m.payment * platformFee)/ 10_000;
         uint256 payout = m.payment - fee;
 
         (bool ok1, ) = jobs[jobId].freelancer.call{value : payout}("");
@@ -543,7 +606,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
             require(ok2, "Fee Payment Failed");
         }
 
-        completedJobsCount[jobs[jobId].freelancer]++;
+        completedJobCount[jobs[jobId].freelancer]++;
 
         emit MilestoneApproved(jobId, milestoneId, jobs[jobId].freelancer, payout);
     }
@@ -551,13 +614,13 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
     // Client disputes a milestone
 
     function disputeMilestone(uint256 jobId, uint256 milestoneId) external onlyClient(jobId){
-        if(!MilestoneJob[jobId]) revert NotMilestoneJob();
-        if(milestoneId >= jobsMilestone[jobId].length) revert InvalidMilestoneId(milestoneId);
+        if(!isMilestoneJob[jobId]) revert NotMilestoneJob();
+        if(milestoneId >= jobMilestones[jobId].length) revert InvalidMilestoneId(milestoneId);
 
         Milestone storage m = jobMilestones[jobId][milestoneId];
         require(m.status == MilestoneStatus.Submitted, "Milestone not submitted");
 
-        m.status = MilestoneStats.Disputed;
+        m.status = MilestoneStatus.Disputed;
 
         emit MilestoneDisputed(jobId, milestoneId, msg.sender);
     }
@@ -622,34 +685,34 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         if(job.isTokenPayment){
             _payWithToken(job.paymentToken, job.freelancer, job.tokenAmount, fee);
         }else{
-            (bool ok1, ) = job.freelancer.call{value : "payout"}("");
+            (bool ok1, ) = job.freelancer.call{value : payout}("");
             require(ok1, "Freelancer Payment Failed");
 
             if( fee > 0){
-                (bool ok2, ) = owner.call{value : "fee"}("");
+                (bool ok2, ) = owner.call{value : fee}("");
                 require(ok2, "Fee Payment Failed");
             }
         }
 
-        completedJobsCount[job.freelancer];
-        emit ReputationUpdated(job.freelancer, getReputationScoree[jobs.freelancer]);
+        completedJobCount[job.freelancer]++;
+        emit ReputationUpdated(job.freelancer, getReputationScore(job.freelancer));
         emit JobCompleted(jobId, job.freelancer, payout);
     }
 
     // Internal: pay with ERC-20 token
 
-    function _payWithToken(address tokenAddress, address freelnacer, uint256 tokenAmount, uint256 fee) internal{
+    function _payWithToken(address tokenAddress, address freelancer, uint256 tokenAmount, uint256) internal{
         IERC20 token = IERC20(tokenAddress);
 
         uint256 tokenFee = (tokenAmount * platformFee) / 10_000;
         uint256 tokenPayout = tokenAmount - tokenFee;
 
-        bool ok1 = token.transfer(freelancer, tokenpayout);
+        bool ok1 = token.transfer(freelancer, tokenPayout);
         if(!ok1) revert TokenTransferFailed();
 
         if(tokenFee > 0){
-            bool ok2 = token.transfer(owner, tokenfee);
-            if(!ok2) revert TokenTranferFailed();
+            bool ok2 = token.transfer(owner, tokenFee);
+            if(!ok2) revert TokenTransferFailed();
         }
 
         emit TokenPaymentReleased(0, freelancer, tokenAddress, tokenPayout);
@@ -688,11 +751,11 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         }
 
         if(freelancerWins){
-            disputesWon[jobs.freelancer]++;
-            disputesLost[jobs.client++;]
+            disputesWon[job.freelancer]++;
+            disputesLost[job.client]++;
         }else{
-            disputesWon[jobs.client]++;
-            disputesLost[jobs.freelancer]++;
+            disputesWon[job.client]++;
+            disputesLost[job.freelancer]++;
         }
 
         emit DisputeResolved(jobId, winner, payout);
@@ -712,9 +775,9 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
 
         if(job.isTokenPayment){
             bool ok = IERC20(job.paymentToken).transfer(job.client, job.tokenAmount);
-            if(!ok1) revert TokenTransferFailed();
+            if(!ok) revert TokenTransferFailed();
         }else{
-            (bool ok,) = job.client.call{value : "job.payment"}("");
+            (bool ok,) = job.client.call{value : job.payment}("");
             require(ok, "Refund Failed");
         }
 
@@ -738,7 +801,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
             bool ok = IERC20(job.paymentToken).transfer(job.client, job.tokenAmount);
             if(!ok) revert TokenTransferFailed();
         }else{
-            bool ok = job.client.call{value : "job.payment"}("");
+            (bool ok,) = job.client.call{value : job.payment}("");
             require(ok, "Refund Failed");
         }
 
@@ -962,11 +1025,11 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         }
 
         if(freelancerWins){
-            disputesWon[freelancer]++;
-            disputesLost[client]++;
+            disputesWon[job.freelancer]++;
+            disputesLost[job.client]++;
         }else{
-            diputesWon[client]++;
-            disputesLost[freelancer]++;
+            disputesWon[job.client]++;
+            disputesLost[job.freelancer]++;
         }
 
         emit DisputeResolved(jobId, winner, payout);
@@ -1018,14 +1081,15 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
 
     // Update your Profile
 
-    function updateProfile() external {
-        if(hasProfile[msg.sender]) revert ProfileAlreadyExists(msg.sender);
+    function updateProfile(string memory bio, string memory portfolioLink, string memory skills, uint256 hourlyRate, bool available) external {
+        if(!hasProfile[msg.sender]) revert ProfileNotFound(msg.sender);
 
         Profile storage p = profiles[msg.sender];
         p.bio = bio;
         p.portfolioLink = portfolioLink;
         p.skills = skills;
         p.hourlyRate = hourlyRate;
+        p.available = available;
         p.updatedAt = block.timestamp;
 
         emit ProfileUpdated(msg.sender, block.timestamp);
@@ -1053,7 +1117,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
     // Get all jobs with pagination
 
     function getJobsPaginated(uint256 offset, uint256 limit) external view returns(uint256[] memory result, uint256 total){
-        total = allJobsIds.length;
+        total = allJobIds.length;
         if(offset >= total){
             return (new uint256[](0), total);
         }
@@ -1061,7 +1125,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         if(end > total) end = total;
 
         result = new uint256[](end - offset);
-        for(uint i = offset; i < end; i++){
+        for(uint256 i = offset; i < end; i++){
             result[i - offset] = allJobIds[i];
         }
     }
@@ -1073,7 +1137,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         for(uint256 i = 0; i < allJobIds.length; i++){
             uint256 jid = allJobIds[i];
 
-            if(jid.payment >= minBudget && jid.payment <= maxBudget && jid.payment == JobStatus.Funded){
+            if(jobs[jid].payment >= minBudget && jobs[jid].payment <= maxBudget && jobs[jid].status == JobStatus.Funded){
                 count++;
             }
         }
@@ -1082,7 +1146,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         uint256 idx = 0;
         for(uint256 i = 0; i < allJobIds.length; i++){
             uint256 jid = allJobIds[i];
-            if(jid.payment >= minBudget && jid.payment <= maxBudget && jid.payment == JobStatus.Funded){
+            if(jobs[jid].payment >= minBudget && jobs[jid].payment <= maxBudget && jobs[jid].status == JobStatus.Funded){
                 result[idx++] = jid;
             }
         }
@@ -1107,26 +1171,26 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
 
     function _addToAutoRefund(uint256 jobId) internal{
         if(!addedToAutoRefund[jobId]){
-            autoRefundEligible.push[jobId];
+            autoRefundEligible.push(jobId);
             addedToAutoRefund[jobId] = true;
         }
     }
 
     // Chainlink calls this to check if work needed
 
-    function checkUpKeep(bytes calldata) external view override returns(bool upKeepNeeded, bytes memory performData)[
+    function checkUpKeep(bytes calldata) external view override returns(bool upKeepNeeded, bytes memory performData){
         for(uint256 i = 0; i < autoRefundEligible.length; i++){
             uint256 jobId = autoRefundEligible[i];
             Job storage job = jobs[jobId];
 
-            if(block.timestamp > deadline && jobs.status == JobStatus.Funded || job.status == JobStatus.Started){
+            if(block.timestamp > job.deadline && (job.status == JobStatus.Funded || job.status == JobStatus.Started)){
                 upKeepNeeded = true;
                 performData = abi.encode(jobId);
                 return(upKeepNeeded, performData);
             }
         }
         return(false, "");
-    ]
+    }
 
     // Chainlink calls this to execute the refund
 
@@ -1137,10 +1201,10 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         require(block.timestamp > job.deadline, "Deadline Not Passed");
         require(job.status == JobStatus.Funded || job.status == JobStatus.Started, "Cannot auto refund at this stage");
 
-        job.status == JobStatus.Refunded;
+        job.status = JobStatus.Refunded;
 
         if(job.isTokenPayment){
-            (bool ok, ) = IERC20(job.paymentToken).transfer(job.client, job.tokenAmount);
+            bool ok = IERC20(job.paymentToken).transfer(job.client, job.tokenAmount);
             require(ok, "Token Refund Failed");
         }else{
             (bool ok, ) = job.client.call{value : job.payment}("");
@@ -1159,7 +1223,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
         // Component 1: Completed jobs (max 40 points)
         // 1 job = 2 points, max 40 points (20 jobs)
 
-        uint256 jobScore = completedJobsCount[user] * 2;
+        uint256 jobScore = completedJobCount[user] * 2;
         if(jobScore > 40) jobScore = 40;
 
         // Component 2: Average rating (max 30 points)
@@ -1202,9 +1266,9 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
 
     function getReputationBreakdown(address user) external view returns(uint256 totalScore, uint256 jobsCompleted, uint256 averageRating, uint256 diputesWin, uint256 diputesLost, uint256 tipsReceivedWei){
         totalScore = getReputationScore(user);
-        jobsCompleted = completedJobsCount[user];
-        disputesWin = disputesWon[user];
-        disputesLost = diputeLost[user];
+        jobsCompleted = completedJobCount[user];
+        diputesWin = disputesWon[user];
+        diputesLost = disputesLost[user];
         tipsReceivedWei = totalTipsReceived[user];
 
         Rating[] memory ratings = freelancerRatings[user];
@@ -1234,7 +1298,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
 
     // Save a job template
 
-    function saveTemplate(string memory title, string memory description, Category category, uint256 defaultDeadlineDays, uint256 defaultBudget) external view returns (uint256 templateId){
+    function saveTemplate(string memory title, string memory description, Category category, uint256 defaultDeadlineDays, uint256 defaultBudget) external returns (uint256 templateId){
         require(bytes(title).length > 0, "Title Required");
         require(defaultDeadlineDays > 0, "Invalid Deadline Days");
 
@@ -1244,6 +1308,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
             id : templateId,
             title : title,
             description : description,
+            category : category,
             defaultDeadlineDays : defaultDeadlineDays,
             defaultBudget : defaultBudget,
             owner : msg.sender,
@@ -1251,7 +1316,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
             createdAt : block.timestamp
         });
 
-        myTemplate[msg.sender].push(templateId);
+        myTemplates[msg.sender].push(templateId);
 
         emit TemplateCreated(templateId, msg.sender, title);
     }
@@ -1259,7 +1324,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
     // Delete (deactivate) a template
 
     function deleteTemplate(uint256 templateId) external{
-        if(templateId == 0 || templateId > templateCount) revert TemplateNitFound(templateId);
+        if(templateId == 0 || templateId > templateCount) revert TemplateNotFound(templateId);
         if(templates[templateId].owner != msg.sender) revert NotTemplateOwner(msg.sender);
 
         templates[templateId].isActive = false;
@@ -1285,7 +1350,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
             client : msg.sender,
             freelancer : freelancer,
             arbiter : arbiter1,
-            payment : msg.value
+            payment : msg.value,
             deadline : block.timestamp + (tmpl.defaultDeadlineDays * 1 days),
             status : JobStatus.Funded,
             title : tmpl.title,
@@ -1294,20 +1359,20 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
             submittedAt : 0,
             workProof : "",
             category : tmpl.category,
-            tags : string[](0),
+            tags : new string[](0),
             paymentToken : address(0),
             tokenAmount : 0,
             isTokenPayment : false
         });
 
-        for(uint i = 0; i < tags.length; i++){
-            jobs[jobId].push(tags[i]);
+        for(uint256 i = 0; i < tags.length; i++){
+            jobs[jobId].tags.push(tags[i]);
         }
 
         clientJobs[msg.sender].push(jobId);
         freelancerJobs[freelancer].push(jobId);
         jobsByCategory[uint256(tmpl.category)].push(jobId);
-        allJobsId.push(jobId);
+        allJobIds.push(jobId);
         jobsByStatus[uint8(JobStatus.Funded)].push(jobId);
 
         arbiterVotes[jobId].arbiter1 = arbiter1;
@@ -1330,7 +1395,7 @@ contract FreelanceEscrow is AutomationCompatibleInterface{
 
     // Get all templates created by an address
 
-    function getMyTemplate(uint256 templateId) external view returns(uint256[] memory){
+    function getMyTemplate(address user) external view returns(uint256[] memory){
         return myTemplates[user];
     }
 
