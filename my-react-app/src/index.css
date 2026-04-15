@@ -1,3 +1,77 @@
-body {
-  margin: 0;
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 222 47% 4%;
+    --foreground: 220 14% 96%;
+
+    --card: 220 30% 8%;
+    --card-foreground: 220 14% 96%;
+
+    --popover: 220 30% 8%;
+    --popover-foreground: 220 14% 96%;
+
+    --primary: 217 91% 60%;
+    --primary-foreground: 220 14% 96%;
+
+    --secondary: 220 20% 14%;
+    --secondary-foreground: 220 14% 96%;
+
+    --muted: 220 20% 14%;
+    --muted-foreground: 220 10% 55%;
+
+    --accent: 262 83% 58%;
+    --accent-foreground: 220 14% 96%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 220 14% 96%;
+
+    --border: 220 20% 18%;
+    --input: 220 20% 18%;
+    --ring: 217 91% 60%;
+
+    --radius: 0.75rem;
+
+    --surface: 220 25% 10%;
+    --surface-foreground: 220 14% 96%;
+    --success: 160 84% 39%;
+
+    --sidebar-background: 220 30% 6%;
+    --sidebar-foreground: 220 14% 96%;
+    --sidebar-primary: 217 91% 60%;
+    --sidebar-primary-foreground: 220 14% 96%;
+    --sidebar-accent: 220 20% 14%;
+    --sidebar-accent-foreground: 220 14% 96%;
+    --sidebar-border: 220 20% 18%;
+    --sidebar-ring: 217 91% 60%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-family: 'Inter', sans-serif;
+  }
+}
+
+@layer utilities {
+  .glass {
+    @apply bg-surface/40 backdrop-blur-xl border border-border/50;
+  }
+
+  .glow-primary {
+    box-shadow: 0 0 40px -10px hsl(var(--primary) / 0.3);
+  }
+
+  .glow-accent {
+    box-shadow: 0 0 40px -10px hsl(var(--accent) / 0.3);
+  }
 }
